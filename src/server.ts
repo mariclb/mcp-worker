@@ -91,7 +91,7 @@ async function listarCursosDaIdentidade(
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "1.1.0"
+    version: "1.2.0"
   });
 
   server.registerTool(
@@ -135,6 +135,106 @@ function createServer() {
           }
         ]
       };
+    }
+  );
+
+  server.registerTool(
+    "testar_conteudo_pos",
+    {
+      description:
+        "Testa se a API do Moodle UFSC permite consultar o conteúdo interno de uma disciplina da pós-graduação usando core_course_get_contents.",
+      inputSchema: {}
+    },
+    async () => {
+      try {
+        const cursosPos =
+          await listarCursosDaIdentidade("pos");
+
+        if (!cursosPos.length) {
+          throw new Error(
+            "Nenhuma disciplina da pós-graduação encontrada."
+          );
+        }
+
+        const curso = cursosPos[0];
+
+        const conteudo = await moodleCall(
+          "pos",
+          "core_course_get_contents",
+          {
+            courseid: String(curso.id)
+          }
+        );
+
+        const resumo = Array.isArray(conteudo)
+          ? conteudo.slice(0, 3).map((secao: any) => ({
+              id: secao.id,
+              nome: secao.name,
+              resumo: secao.summary,
+              visivel: secao.visible,
+              modulos: Array.isArray(secao.modules)
+                ? secao.modules.slice(0, 5).map(
+                    (modulo: any) => ({
+                      id: modulo.id,
+                      nome: modulo.name,
+                      tipo: modulo.modname,
+                      url: modulo.url,
+                      visivel: modulo.visible
+                    })
+                  )
+                : []
+            }))
+          : conteudo;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: true,
+                  funcao:
+                    "core_course_get_contents",
+                  identidade: "pos",
+                  disciplina_testada: {
+                    id: curso.id,
+                    nome: curso.nome,
+                    nome_curto: curso.nome_curto
+                  },
+                  secoes_retornadas:
+                    Array.isArray(conteudo)
+                      ? conteudo.length
+                      : null,
+                  amostra: resumo
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: false,
+                  funcao:
+                    "core_course_get_contents",
+                  identidade: "pos",
+                  erro:
+                    error?.message ||
+                    String(error)
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      }
     }
   );
 
