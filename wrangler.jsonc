@@ -17,6 +17,11 @@
       "secret_name": "MOODLE_TOKEN"
     },
     {
+      "binding": "MOODLE_TOKEN_POS",
+      "store_id": "6f91f59af3c440b3a833c4632fcabea3",
+      "secret_name": "MOODLE_TOKEN_POS"
+    },
+    {
       "binding": "CLAUDE_CONNECTOR_KEY_V2",
       "store_id": "6f91f59af3c440b3a833c4632fcabea3",
       "secret_name": "CLAUDE_CONNECTOR_KEY_V2"
