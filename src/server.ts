@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { env } from "cloudflare:workers";
+import { z } from "zod";
 
 const MOODLE_URL =
   "https://presencial.moodle.ufsc.br/webservice/rest/server.php";
@@ -88,10 +89,48 @@ async function listarCursosDaIdentidade(
   }));
 }
 
+async function encontrarDisciplina(
+  courseid: number
+): Promise<{
+  identidade: MoodleIdentity;
+  curso: any;
+}> {
+  const [graduacao, pos] = await Promise.all([
+    listarCursosDaIdentidade("graduacao"),
+    listarCursosDaIdentidade("pos")
+  ]);
+
+  const cursoGraduacao = graduacao.find(
+    (curso: any) => Number(curso.id) === Number(courseid)
+  );
+
+  if (cursoGraduacao) {
+    return {
+      identidade: "graduacao",
+      curso: cursoGraduacao
+    };
+  }
+
+  const cursoPos = pos.find(
+    (curso: any) => Number(curso.id) === Number(courseid)
+  );
+
+  if (cursoPos) {
+    return {
+      identidade: "pos",
+      curso: cursoPos
+    };
+  }
+
+  throw new Error(
+    `Disciplina com courseid ${courseid} não encontrada nas identidades de graduação ou pós.`
+  );
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "1.2.0"
+    version: "2.0.0"
   });
 
   server.registerTool(
@@ -99,7 +138,7 @@ function createServer() {
     {
       description:
         "Lista as disciplinas disponíveis nas identidades de graduação e pós-graduação da usuária autenticada no Moodle Presencial da UFSC.",
-      inputSchema: {}
+      inputSchema: z.object({})
     },
     async () => {
       const [graduacao, pos] = await Promise.all([
@@ -107,10 +146,7 @@ function createServer() {
         listarCursosDaIdentidade("pos")
       ]);
 
-      const disciplinas = [
-        ...graduacao,
-        ...pos
-      ];
+      const todas = [...graduacao, ...pos];
 
       return {
         content: [
@@ -118,7 +154,7 @@ function createServer() {
             type: "text",
             text: JSON.stringify(
               {
-                total: disciplinas.length,
+                total: todas.length,
                 graduacao: {
                   total: graduacao.length,
                   disciplinas: graduacao
@@ -127,7 +163,7 @@ function createServer() {
                   total: pos.length,
                   disciplinas: pos
                 },
-                todas: disciplinas
+                todas
               },
               null,
               2
@@ -139,52 +175,55 @@ function createServer() {
   );
 
   server.registerTool(
-    "testar_conteudo_pos",
+    "consultar_disciplina",
     {
       description:
-        "Testa se a API do Moodle UFSC permite consultar o conteúdo interno de uma disciplina da pós-graduação usando core_course_get_contents.",
-      inputSchema: {}
+        "Consulta o conteúdo interno de uma disciplina específica do Moodle UFSC. Use primeiro listar_disciplinas para descobrir o courseid.",
+      inputSchema: z.object({
+        courseid: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "ID numérico da disciplina retornado por listar_disciplinas"
+          )
+      })
     },
-    async () => {
+    async ({ courseid }) => {
       try {
-        const cursosPos =
-          await listarCursosDaIdentidade("pos");
-
-        if (!cursosPos.length) {
-          throw new Error(
-            "Nenhuma disciplina da pós-graduação encontrada."
-          );
-        }
-
-        const curso = cursosPos[0];
+        const { identidade, curso } =
+          await encontrarDisciplina(courseid);
 
         const conteudo = await moodleCall(
-          "pos",
+          identidade,
           "core_course_get_contents",
           {
-            courseid: String(curso.id)
+            courseid: String(courseid)
           }
         );
 
-        const resumo = Array.isArray(conteudo)
-          ? conteudo.slice(0, 3).map((secao: any) => ({
+        const secoes = Array.isArray(conteudo)
+          ? conteudo.map((secao: any) => ({
               id: secao.id,
               nome: secao.name,
               resumo: secao.summary,
               visivel: secao.visible,
               modulos: Array.isArray(secao.modules)
-                ? secao.modules.slice(0, 5).map(
-                    (modulo: any) => ({
-                      id: modulo.id,
-                      nome: modulo.name,
-                      tipo: modulo.modname,
-                      url: modulo.url,
-                      visivel: modulo.visible
-                    })
-                  )
+                ? secao.modules.map((modulo: any) => ({
+                    id: modulo.id,
+                    nome: modulo.name,
+                    tipo: modulo.modname,
+                    url: modulo.url,
+                    visivel: modulo.visible,
+                    descricao: modulo.description,
+                    disponibilidade:
+                      modulo.availability,
+                    datas: modulo.dates,
+                    conteudos: modulo.contents
+                  }))
                 : []
             }))
-          : conteudo;
+          : [];
 
         return {
           content: [
@@ -193,19 +232,14 @@ function createServer() {
               text: JSON.stringify(
                 {
                   sucesso: true,
-                  funcao:
-                    "core_course_get_contents",
-                  identidade: "pos",
-                  disciplina_testada: {
+                  disciplina: {
                     id: curso.id,
                     nome: curso.nome,
-                    nome_curto: curso.nome_curto
+                    nome_curto: curso.nome_curto,
+                    identidade
                   },
-                  secoes_retornadas:
-                    Array.isArray(conteudo)
-                      ? conteudo.length
-                      : null,
-                  amostra: resumo
+                  total_secoes: secoes.length,
+                  secoes
                 },
                 null,
                 2
@@ -221,9 +255,7 @@ function createServer() {
               text: JSON.stringify(
                 {
                   sucesso: false,
-                  funcao:
-                    "core_course_get_contents",
-                  identidade: "pos",
+                  courseid,
                   erro:
                     error?.message ||
                     String(error)
@@ -232,7 +264,8 @@ function createServer() {
                 2
               )
             }
-          ]
+          ],
+          isError: true
         };
       }
     }
