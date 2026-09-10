@@ -4,8 +4,30 @@
   "compatibility_date": "2026-06-11",
   "compatibility_flags": ["nodejs_compat"],
   "main": "src/server.ts",
+
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/mcp"]
+  },
+
+  "secrets_store_secrets": [
+    {
+      "binding": "MOODLE_TOKEN",
+      "store_id": "6f91f59af3c440b3a833c4632fcabea3",
+      "secret_name": "MOODLE_TOKEN"
+    },
+    {
+      "binding": "CLAUDE_CONNECTOR_KEY_V2",
+      "store_id": "6f91f59af3c440b3a833c4632fcabea3",
+      "secret_name": "CLAUDE_CONNECTOR_KEY_V2"
+    }
+  ],
+
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "persist": true
+    }
   }
 }
