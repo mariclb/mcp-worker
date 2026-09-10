@@ -123,14 +123,77 @@ async function encontrarDisciplina(
   }
 
   throw new Error(
-    `Disciplina com courseid ${courseid} não encontrada nas identidades de graduação ou pós.`
+    `Disciplina com courseid ${courseid} não encontrada.`
   );
+}
+
+async function extrairPendenciasDaDisciplina(
+  curso: any,
+  identidade: MoodleIdentity
+) {
+  const conteudo = await moodleCall(
+    identidade,
+    "core_course_get_contents",
+    {
+      courseid: String(curso.id)
+    }
+  );
+
+  const pendencias: any[] = [];
+
+  if (!Array.isArray(conteudo)) {
+    return pendencias;
+  }
+
+  for (const secao of conteudo) {
+    if (!Array.isArray(secao.modules)) continue;
+
+    for (const modulo of secao.modules) {
+      if (modulo.modname !== "assign") continue;
+
+      const datas = Array.isArray(modulo.dates)
+        ? modulo.dates
+        : [];
+
+      const abertura = datas.find(
+        (d: any) =>
+          d.dataid === "allowsubmissionsfromdate" ||
+          d.label?.toLowerCase().includes("abertura") ||
+          d.label?.toLowerCase().includes("disponível")
+      );
+
+      const vencimento = datas.find(
+        (d: any) =>
+          d.dataid === "duedate" ||
+          d.label?.toLowerCase().includes("vencimento") ||
+          d.label?.toLowerCase().includes("entrega")
+      );
+
+      pendencias.push({
+        disciplina_id: curso.id,
+        disciplina: curso.nome,
+        disciplina_nome_curto: curso.nome_curto,
+        identidade,
+        secao: secao.name,
+        atividade_id: modulo.id,
+        atividade: modulo.name,
+        tipo: modulo.modname,
+        url: modulo.url,
+        visivel: modulo.visible,
+        abertura: abertura?.timestamp ?? null,
+        vencimento: vencimento?.timestamp ?? null,
+        datas
+      });
+    }
+  }
+
+  return pendencias;
 }
 
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "2.0.0"
+    version: "3.0.0"
   });
 
   server.registerTool(
@@ -178,7 +241,7 @@ function createServer() {
     "consultar_disciplina",
     {
       description:
-        "Consulta o conteúdo interno de uma disciplina específica do Moodle UFSC. Use primeiro listar_disciplinas para descobrir o courseid.",
+        "Consulta o conteúdo interno de uma disciplina específica do Moodle UFSC. Use listar_disciplinas para descobrir o courseid.",
       inputSchema: z.object({
         courseid: z
           .number()
@@ -256,6 +319,89 @@ function createServer() {
                 {
                   sucesso: false,
                   courseid,
+                  erro:
+                    error?.message ||
+                    String(error)
+                },
+                null,
+                2
+              )
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "listar_pendencias",
+    {
+      description:
+        "Lista tarefas do tipo assignment encontradas nas disciplinas de graduação e pós-graduação, incluindo datas de abertura, vencimento e links.",
+      inputSchema: z.object({})
+    },
+    async () => {
+      try {
+        const [graduacao, pos] = await Promise.all([
+          listarCursosDaIdentidade("graduacao"),
+          listarCursosDaIdentidade("pos")
+        ]);
+
+        const resultados = await Promise.all([
+          ...graduacao.map((curso: any) =>
+            extrairPendenciasDaDisciplina(
+              curso,
+              "graduacao"
+            )
+          ),
+          ...pos.map((curso: any) =>
+            extrairPendenciasDaDisciplina(
+              curso,
+              "pos"
+            )
+          )
+        ]);
+
+        const pendencias = resultados
+          .flat()
+          .sort((a: any, b: any) => {
+            if (
+              a.vencimento === null &&
+              b.vencimento === null
+            ) {
+              return 0;
+            }
+
+            if (a.vencimento === null) return 1;
+            if (b.vencimento === null) return -1;
+
+            return a.vencimento - b.vencimento;
+          });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  total: pendencias.length,
+                  pendencias
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: false,
                   erro:
                     error?.message ||
                     String(error)
