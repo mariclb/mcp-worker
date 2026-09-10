@@ -193,7 +193,7 @@ async function extrairPendenciasDaDisciplina(
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "3.0.0"
+    version: "3.1.0"
   });
 
   server.registerTool(
@@ -338,7 +338,7 @@ function createServer() {
     "listar_pendencias",
     {
       description:
-        "Lista tarefas do tipo assignment encontradas nas disciplinas de graduação e pós-graduação, incluindo datas de abertura, vencimento e links.",
+        "Lista tarefas do tipo assignment nas disciplinas ativas do semestre 2026.2, incluindo graduação e pós-graduação, com datas e links.",
       inputSchema: z.object({})
     },
     async () => {
@@ -348,24 +348,32 @@ function createServer() {
           listarCursosDaIdentidade("pos")
         ]);
 
-        const resultados = await Promise.all([
-          ...graduacao.map((curso: any) =>
-            extrairPendenciasDaDisciplina(
-              curso,
-              "graduacao"
-            )
+        const cursosAtivos = [
+          ...graduacao.filter((curso: any) =>
+            String(curso.nome_curto).includes("20262")
           ),
-          ...pos.map((curso: any) =>
-            extrairPendenciasDaDisciplina(
-              curso,
-              "pos"
-            )
+          ...pos.filter((curso: any) =>
+            String(curso.nome_curto).includes("20262")
           )
-        ]);
+        ];
 
-        const pendencias = resultados
-          .flat()
-          .sort((a: any, b: any) => {
+        const resultados: any[] = [];
+
+        for (const curso of cursosAtivos) {
+          const identidade =
+            curso.identidade as MoodleIdentity;
+
+          const pendencias =
+            await extrairPendenciasDaDisciplina(
+              curso,
+              identidade
+            );
+
+          resultados.push(...pendencias);
+        }
+
+        const pendenciasOrdenadas = resultados.sort(
+          (a: any, b: any) => {
             if (
               a.vencimento === null &&
               b.vencimento === null
@@ -377,7 +385,8 @@ function createServer() {
             if (b.vencimento === null) return -1;
 
             return a.vencimento - b.vencimento;
-          });
+          }
+        );
 
         return {
           content: [
@@ -385,8 +394,11 @@ function createServer() {
               type: "text",
               text: JSON.stringify(
                 {
-                  total: pendencias.length,
-                  pendencias
+                  semestre: "20262",
+                  disciplinas_consultadas:
+                    cursosAtivos.length,
+                  total: pendenciasOrdenadas.length,
+                  pendencias: pendenciasOrdenadas
                 },
                 null,
                 2
