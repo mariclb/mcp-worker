@@ -779,6 +779,143 @@ async function obterPaginaMoodle(
   return candidatos[0];
 }
 
+
+async function obterModuloExatoDoCurso(
+  courseid: number,
+  identidade: MoodleIdentity,
+  moduloId: number
+) {
+  const conteudo = await moodleCall(
+    identidade,
+    "core_course_get_contents",
+    {
+      courseid: String(courseid)
+    }
+  );
+
+  if (!Array.isArray(conteudo)) {
+    return null;
+  }
+
+  for (const secao of conteudo) {
+    if (!Array.isArray(secao.modules)) continue;
+
+    const modulo = secao.modules.find(
+      (item: any) => Number(item.id) === Number(moduloId)
+    );
+
+    if (modulo) {
+      return {
+        secao,
+        modulo
+      };
+    }
+  }
+
+  return null;
+}
+
+async function obterPaginaMoodlePorModuloId(
+  courseid: number,
+  identidade: MoodleIdentity,
+  moduloId: number
+) {
+  const localizado = await obterModuloExatoDoCurso(
+    courseid,
+    identidade,
+    moduloId
+  );
+
+  if (!localizado) {
+    throw new Error(
+      `Módulo ${moduloId} não encontrado no courseid ${courseid}.`
+    );
+  }
+
+  const { modulo } = localizado;
+
+  if (modulo.modname !== "page") {
+    return null;
+  }
+
+  const retorno = await moodleCall(
+    identidade,
+    "mod_page_get_pages_by_courses",
+    {
+      "courseids[0]": String(courseid)
+    }
+  );
+
+  const paginas = Array.isArray(retorno?.pages)
+    ? retorno.pages
+    : [];
+
+  // Algumas versões do Moodle expõem o cmid como coursemodule/cmid.
+  const porCourseModule = paginas.find(
+    (page: any) =>
+      Number(page.coursemodule ?? page.cmid ?? 0) ===
+      Number(moduloId)
+  );
+
+  if (porCourseModule) {
+    return porCourseModule;
+  }
+
+  // Fallback determinístico: o nome do módulo em core_course_get_contents
+  // corresponde ao nome da instância da página. A comparação é EXATA,
+  // portanto "Plano de Ensino_Detalhado" não casa com "(copiado)".
+  const porNomeExato = paginas.filter(
+    (page: any) =>
+      String(page.name ?? "").trim() ===
+      String(modulo.name ?? "").trim()
+  );
+
+  if (porNomeExato.length === 1) {
+    return porNomeExato[0];
+  }
+
+  if (porNomeExato.length > 1) {
+    const porInstance = porNomeExato.find(
+      (page: any) =>
+        Number(page.id ?? 0) === Number(modulo.instance ?? -1)
+    );
+
+    if (porInstance) {
+      return porInstance;
+    }
+
+    throw new Error(
+      `O módulo ${moduloId} corresponde a mais de uma página com o mesmo nome e não foi possível resolver de forma determinística.`
+    );
+  }
+
+  throw new Error(
+    `A página do módulo ${moduloId} foi encontrada no curso, mas não pôde ser associada de forma determinística ao retorno de mod_page_get_pages_by_courses.`
+  );
+}
+
+function localizarArquivosDoModuloExato(
+  materiais: any[],
+  moduloId: number
+) {
+  const material = materiais.find(
+    (item: any) => Number(item.modulo_id) === Number(moduloId)
+  );
+
+  if (!material) {
+    return null;
+  }
+
+  const arquivos = Array.isArray(material.arquivos)
+    ? material.arquivos
+    : [];
+
+  return {
+    material,
+    arquivos
+  };
+}
+
 async function extrairTextoPaginaMoodle(page: any) {
   const content = String(page?.content ?? "");
   const textoDireto = htmlParaTexto(content);
@@ -1108,7 +1245,7 @@ async function diagnosticarFormatosPlano(
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "6.2.0"
+    version: "6.3.0"
   });
 
   server.registerTool(
@@ -1701,53 +1838,167 @@ function createServer() {
     "ler_material",
     {
       description:
-        "Localiza e lê materiais acadêmicos do Moodle UFSC em PDF, DOCX ou página HTML do Moodle. Para páginas com Google Docs publicado, também tenta extrair o texto incorporado.",
-      inputSchema: z.object({
-        courseid: z
-          .number()
-          .int()
-          .positive()
-          .describe(
-            "ID numérico da disciplina retornado por listar_disciplinas"
-          ),
-        termo: z
-          .string()
-          .trim()
-          .min(1)
-          .describe(
-            "Termo usado para localizar o material, por exemplo plano de ensino, cronograma ou DEMATEL"
-          )
-      })
+        "Localiza e lê materiais acadêmicos do Moodle UFSC em PDF, DOCX ou página HTML. Pode selecionar exatamente um módulo por modulo_id; quando modulo_id é informado, ele tem precedência total sobre termo.",
+      inputSchema: z
+        .object({
+          courseid: z
+            .number()
+            .int()
+            .positive()
+            .describe(
+              "ID numérico da disciplina retornado por listar_disciplinas"
+            ),
+          termo: z
+            .string()
+            .trim()
+            .min(1)
+            .optional()
+            .describe(
+              "Termo usado para localizar o material quando modulo_id não for informado"
+            ),
+          modulo_id: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+              "ID exato do módulo (cmid) retornado por consultar_disciplina/listar_materiais. Quando informado, ignora correspondências por termo e lê somente esse módulo."
+            )
+        })
+        .refine(
+          (dados) => Boolean(dados.termo || dados.modulo_id),
+          {
+            message:
+              "Informe termo ou modulo_id para localizar o material."
+          }
+        )
     },
-    async ({ courseid, termo }) => {
+    async ({ courseid, termo, modulo_id }) => {
       try {
         const { identidade, curso, materiais } =
           await obterMateriaisDaDisciplina(courseid);
 
-        const arquivoPdf = localizarArquivoPorTermo(
-          materiais,
-          termo,
-          [".pdf", "application/pdf"]
-        );
+        let arquivoPdf: any = null;
+        let arquivoDocx: any = null;
+        let pagina: any = null;
+        let selecao: any = null;
 
-        const arquivoDocx = localizarArquivoPorTermo(
-          materiais,
-          termo,
-          [
-            ".docx",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-          ]
-        );
+        if (modulo_id) {
+          const moduloExato = await obterModuloExatoDoCurso(
+            courseid,
+            identidade,
+            modulo_id
+          );
 
-        const pagina = await obterPaginaMoodle(
-          courseid,
-          identidade,
-          termo
-        );
+          if (!moduloExato) {
+            throw new Error(
+              `Módulo ${modulo_id} não encontrado na disciplina ${courseid}.`
+            );
+          }
+
+          const { secao, modulo } = moduloExato;
+
+          selecao = {
+            modo: "modulo_id",
+            modulo_id,
+            modulo_nome: modulo.name ?? null,
+            modulo_tipo: modulo.modname ?? null,
+            secao: secao.name ?? null
+          };
+
+          if (modulo.modname === "page") {
+            pagina = await obterPaginaMoodlePorModuloId(
+              courseid,
+              identidade,
+              modulo_id
+            );
+          } else {
+            const localizado = localizarArquivosDoModuloExato(
+              materiais,
+              modulo_id
+            );
+
+            if (!localizado) {
+              throw new Error(
+                `O módulo ${modulo_id} foi encontrado, mas não possui material de arquivo suportado por ler_material.`
+              );
+            }
+
+            const pdf = localizado.arquivos.find(
+              (arquivo: any) => {
+                const nome = normalizarTexto(arquivo.nome);
+                const mime = normalizarTexto(arquivo.mimetype);
+                return (
+                  nome.endsWith(".pdf") ||
+                  mime.includes("application/pdf")
+                );
+              }
+            );
+
+            const docx = localizado.arquivos.find(
+              (arquivo: any) => {
+                const nome = normalizarTexto(arquivo.nome);
+                const mime = normalizarTexto(arquivo.mimetype);
+                return (
+                  nome.endsWith(".docx") ||
+                  mime.includes(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  )
+                );
+              }
+            );
+
+            if (pdf) {
+              arquivoPdf = {
+                material: localizado.material,
+                arquivo: pdf
+              };
+            } else if (docx) {
+              arquivoDocx = {
+                material: localizado.material,
+                arquivo: docx
+              };
+            } else {
+              throw new Error(
+                `O módulo ${modulo_id} foi localizado, mas não contém PDF ou DOCX suportado.`
+              );
+            }
+          }
+        } else {
+          const termoBusca = String(termo);
+
+          selecao = {
+            modo: "termo",
+            termo: termoBusca
+          };
+
+          arquivoPdf = localizarArquivoPorTermo(
+            materiais,
+            termoBusca,
+            [".pdf", "application/pdf"]
+          );
+
+          arquivoDocx = localizarArquivoPorTermo(
+            materiais,
+            termoBusca,
+            [
+              ".docx",
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ]
+          );
+
+          pagina = await obterPaginaMoodle(
+            courseid,
+            identidade,
+            termoBusca
+          );
+        }
 
         if (!arquivoPdf && !arquivoDocx && !pagina) {
           throw new Error(
-            `Nenhum material suportado com o termo "${termo}" foi encontrado na disciplina.`
+            modulo_id
+              ? `O módulo ${modulo_id} não contém material em formato suportado.`
+              : `Nenhum material suportado com o termo "${termo}" foi encontrado na disciplina.`
           );
         }
 
@@ -1775,6 +2026,7 @@ function createServer() {
                     {
                       sucesso: false,
                       formato: "pdf",
+                      selecao,
                       motivo: "arquivo_muito_grande",
                       limite_mb: MAX_PDF_BYTES / 1024 / 1024,
                       tamanho_mb: tamanhoMb,
@@ -1807,6 +2059,7 @@ function createServer() {
                   {
                     sucesso: !semTexto,
                     formato: "pdf",
+                    selecao,
                     motivo: semTexto
                       ? "pdf_sem_texto_extraivel"
                       : null,
@@ -1816,6 +2069,7 @@ function createServer() {
                       identidade
                     },
                     material: {
+                      modulo_id: arquivoPdf.material.modulo_id,
                       nome: arquivoPdf.material.nome,
                       secao: arquivoPdf.material.secao
                     },
@@ -1879,6 +2133,7 @@ function createServer() {
                     {
                       sucesso: false,
                       formato: "docx",
+                      selecao,
                       motivo: "arquivo_muito_grande",
                       limite_mb: MAX_DOCX_BYTES / 1024 / 1024,
                       tamanho_mb: tamanhoMb,
@@ -1911,6 +2166,7 @@ function createServer() {
                   {
                     sucesso: !semTexto,
                     formato: "docx",
+                    selecao,
                     motivo: semTexto
                       ? "docx_sem_texto_extraivel"
                       : null,
@@ -1920,6 +2176,7 @@ function createServer() {
                       identidade
                     },
                     material: {
+                      modulo_id: arquivoDocx.material.modulo_id,
                       nome: arquivoDocx.material.nome,
                       secao: arquivoDocx.material.secao
                     },
@@ -1971,6 +2228,7 @@ function createServer() {
                   {
                     sucesso: !semTexto,
                     formato: "pagina_html",
+                    selecao,
                     motivo: semTexto
                       ? "pagina_sem_texto_extraivel"
                       : null,
@@ -1981,6 +2239,8 @@ function createServer() {
                     },
                     pagina: {
                       id: pagina.id ?? null,
+                      coursemodule:
+                        pagina.coursemodule ?? pagina.cmid ?? modulo_id ?? null,
                       nome: pagina.name ?? null,
                       timemodified: pagina.timemodified ?? null
                     },
@@ -2022,7 +2282,8 @@ function createServer() {
                 {
                   sucesso: false,
                   courseid,
-                  termo,
+                  termo: termo ?? null,
+                  modulo_id: modulo_id ?? null,
                   motivo: "erro_leitura_material",
                   erro: error?.message || String(error)
                 },
