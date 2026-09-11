@@ -193,7 +193,7 @@ async function extrairPendenciasDaDisciplina(
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "3.1.0"
+    version: "4.0.0"
   });
 
   server.registerTool(
@@ -338,17 +338,72 @@ function createServer() {
     "listar_pendencias",
     {
       description:
-        "Lista tarefas do tipo assignment nas disciplinas ativas do semestre 2026.2, incluindo graduação e pós-graduação, com datas e links.",
-      inputSchema: z.object({})
-    },
-    async () => {
-      try {
-        const [graduacao, pos] = await Promise.all([
-          listarCursosDaIdentidade("graduacao"),
-          listarCursosDaIdentidade("pos")
-        ]);
+        "Lista assignments do semestre 2026.2 com filtros por janela de dias, identidade e disciplina. Retorna tarefas ordenadas por vencimento.",
+      inputSchema: z.object({
+        dias: z
+          .number()
+          .int()
+          .min(1)
+          .max(90)
+          .default(7)
+          .describe(
+            "Quantidade de dias futuros a considerar a partir de agora"
+          ),
 
-        const cursosAtivos = [
+        identidade: z
+          .enum(["graduacao", "pos", "todas"])
+          .default("todas")
+          .describe(
+            "Filtra por graduação, pós-graduação ou ambas"
+          ),
+
+        courseid: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "ID opcional de uma disciplina específica"
+          ),
+
+        incluir_sem_data: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Se verdadeiro, inclui assignments sem data de vencimento"
+          )
+      })
+    },
+    async ({
+      dias = 7,
+      identidade = "todas",
+      courseid,
+      incluir_sem_data = false
+    }) => {
+      try {
+        const agora = Math.floor(Date.now() / 1000);
+        const limite = agora + dias * 24 * 60 * 60;
+
+        let graduacao: any[] = [];
+        let pos: any[] = [];
+
+        if (
+          identidade === "graduacao" ||
+          identidade === "todas"
+        ) {
+          graduacao =
+            await listarCursosDaIdentidade("graduacao");
+        }
+
+        if (
+          identidade === "pos" ||
+          identidade === "todas"
+        ) {
+          pos =
+            await listarCursosDaIdentidade("pos");
+        }
+
+        let cursosAtivos = [
           ...graduacao.filter((curso: any) =>
             String(curso.nome_curto).includes("20262")
           ),
@@ -357,23 +412,46 @@ function createServer() {
           )
         ];
 
+        if (courseid) {
+          cursosAtivos = cursosAtivos.filter(
+            (curso: any) =>
+              Number(curso.id) === Number(courseid)
+          );
+        }
+
+        if (courseid && cursosAtivos.length === 0) {
+          throw new Error(
+            `Disciplina com courseid ${courseid} não encontrada no semestre 2026.2 para o filtro selecionado.`
+          );
+        }
+
         const resultados: any[] = [];
 
         for (const curso of cursosAtivos) {
-          const identidade =
+          const identidadeCurso =
             curso.identidade as MoodleIdentity;
 
           const pendencias =
             await extrairPendenciasDaDisciplina(
               curso,
-              identidade
+              identidadeCurso
             );
 
           resultados.push(...pendencias);
         }
 
-        const pendenciasOrdenadas = resultados.sort(
-          (a: any, b: any) => {
+        const filtradas = resultados
+          .filter((item: any) => {
+            if (item.vencimento === null) {
+              return incluir_sem_data;
+            }
+
+            return (
+              item.vencimento >= agora &&
+              item.vencimento <= limite
+            );
+          })
+          .sort((a: any, b: any) => {
             if (
               a.vencimento === null &&
               b.vencimento === null
@@ -385,8 +463,7 @@ function createServer() {
             if (b.vencimento === null) return -1;
 
             return a.vencimento - b.vencimento;
-          }
-        );
+          });
 
         return {
           content: [
@@ -394,11 +471,22 @@ function createServer() {
               type: "text",
               text: JSON.stringify(
                 {
+                  sucesso: true,
                   semestre: "20262",
+                  filtros: {
+                    dias,
+                    identidade,
+                    courseid: courseid ?? null,
+                    incluir_sem_data
+                  },
+                  periodo: {
+                    inicio_timestamp: agora,
+                    fim_timestamp: limite
+                  },
                   disciplinas_consultadas:
                     cursosAtivos.length,
-                  total: pendenciasOrdenadas.length,
-                  pendencias: pendenciasOrdenadas
+                  total: filtradas.length,
+                  pendencias: filtradas
                 },
                 null,
                 2
