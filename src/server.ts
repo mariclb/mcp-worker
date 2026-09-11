@@ -6,6 +6,9 @@ import { z } from "zod";
 const MOODLE_URL =
   "https://presencial.moodle.ufsc.br/webservice/rest/server.php";
 
+const MOODLE_HOST =
+  "presencial.moodle.ufsc.br";
+
 type MoodleIdentity = "graduacao" | "pos";
 
 const TOKEN_BINDINGS: Record<MoodleIdentity, string> = {
@@ -208,10 +211,151 @@ function correspondeAoTermo(
   );
 }
 
+async function obterMateriaisDaDisciplina(
+  courseid: number
+) {
+  const { identidade, curso } =
+    await encontrarDisciplina(courseid);
+
+  const conteudo = await moodleCall(
+    identidade,
+    "core_course_get_contents",
+    {
+      courseid: String(courseid)
+    }
+  );
+
+  const tiposMaterial = new Set([
+    "resource",
+    "folder",
+    "url",
+    "page",
+    "book"
+  ]);
+
+  const materiais: any[] = [];
+
+  if (Array.isArray(conteudo)) {
+    for (const secao of conteudo) {
+      if (!Array.isArray(secao.modules)) continue;
+
+      for (const modulo of secao.modules) {
+        if (!tiposMaterial.has(modulo.modname)) {
+          continue;
+        }
+
+        const arquivos = Array.isArray(modulo.contents)
+          ? modulo.contents.map((arquivo: any) => ({
+              nome: arquivo.filename ?? null,
+              tipo: arquivo.type ?? null,
+              mimetype: arquivo.mimetype ?? null,
+              tamanho: arquivo.filesize ?? null,
+              url_arquivo: arquivo.fileurl ?? null,
+              modificado_em:
+                arquivo.timemodified ?? null
+            }))
+          : [];
+
+        materiais.push({
+          disciplina_id: curso.id,
+          disciplina: curso.nome,
+          identidade,
+          secao_id: secao.id,
+          secao: secao.name,
+          modulo_id: modulo.id,
+          nome: modulo.name,
+          tipo: modulo.modname,
+          url: modulo.url ?? null,
+          descricao: modulo.description ?? null,
+          visivel: modulo.visible,
+          arquivos
+        });
+      }
+    }
+  }
+
+  return {
+    identidade,
+    curso,
+    materiais
+  };
+}
+
+async function testarDownloadAutenticado(
+  fileUrl: string,
+  identidade: MoodleIdentity
+) {
+  const url = new URL(fileUrl);
+
+  if (url.hostname !== MOODLE_HOST) {
+    throw new Error(
+      "URL de arquivo fora do domínio Moodle UFSC."
+    );
+  }
+
+  if (
+    !url.pathname.startsWith(
+      "/webservice/pluginfile.php/"
+    )
+  ) {
+    throw new Error(
+      "A URL encontrada não é um arquivo webservice/pluginfile do Moodle."
+    );
+  }
+
+  const tokenBinding =
+    TOKEN_BINDINGS[identidade];
+
+  const token =
+    await getSecret(tokenBinding);
+
+  /*
+   * O endpoint webservice/pluginfile.php usa
+   * o token como parâmetro "token".
+   *
+   * Preservamos parâmetros já existentes,
+   * como forcedownload=1.
+   */
+  url.searchParams.set("token", token);
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    redirect: "manual"
+  });
+
+  const resultado = {
+    sucesso: response.ok,
+    status_http: response.status,
+    status_texto: response.statusText,
+    content_type:
+      response.headers.get("content-type"),
+    content_length:
+      response.headers.get("content-length"),
+    content_disposition:
+      response.headers.get("content-disposition"),
+    location_redirect:
+      response.headers.get("location")
+  };
+
+  /*
+   * Não precisamos carregar o PDF inteiro nesta fase.
+   * Cancelamos o body depois de receber cabeçalhos/status.
+   */
+  if (response.body) {
+    try {
+      await response.body.cancel();
+    } catch {
+      // Ignora erro de cancelamento.
+    }
+  }
+
+  return resultado;
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "5.1.0"
+    version: "5.2.0"
   });
 
   server.registerTool(
@@ -296,8 +440,10 @@ function createServer() {
                     tipo: modulo.modname,
                     url: modulo.url,
                     visivel: modulo.visible,
-                    descricao: modulo.description,
-                    disponibilidade: modulo.availability,
+                    descricao:
+                      modulo.description,
+                    disponibilidade:
+                      modulo.availability,
                     datas: modulo.dates,
                     conteudos: modulo.contents
                   }))
@@ -315,7 +461,8 @@ function createServer() {
                   disciplina: {
                     id: curso.id,
                     nome: curso.nome,
-                    nome_curto: curso.nome_curto,
+                    nome_curto:
+                      curso.nome_curto,
                     identidade
                   },
                   total_secoes: secoes.length,
@@ -336,7 +483,9 @@ function createServer() {
                 {
                   sucesso: false,
                   courseid,
-                  erro: error?.message || String(error)
+                  erro:
+                    error?.message ||
+                    String(error)
                 },
                 null,
                 2
@@ -366,7 +515,11 @@ function createServer() {
           ),
 
         identidade: z
-          .enum(["graduacao", "pos", "todas"])
+          .enum([
+            "graduacao",
+            "pos",
+            "todas"
+          ])
           .default("todas")
           .describe(
             "Filtra por graduação, pós-graduação ou ambas"
@@ -396,8 +549,11 @@ function createServer() {
       incluir_sem_data = false
     }) => {
       try {
-        const agora = Math.floor(Date.now() / 1000);
-        const limite = agora + dias * 24 * 60 * 60;
+        const agora =
+          Math.floor(Date.now() / 1000);
+
+        const limite =
+          agora + dias * 24 * 60 * 60;
 
         let graduacao: any[] = [];
         let pos: any[] = [];
@@ -407,7 +563,9 @@ function createServer() {
           identidade === "todas"
         ) {
           graduacao =
-            await listarCursosDaIdentidade("graduacao");
+            await listarCursosDaIdentidade(
+              "graduacao"
+            );
         }
 
         if (
@@ -415,26 +573,39 @@ function createServer() {
           identidade === "todas"
         ) {
           pos =
-            await listarCursosDaIdentidade("pos");
+            await listarCursosDaIdentidade(
+              "pos"
+            );
         }
 
         let cursosAtivos = [
-          ...graduacao.filter((curso: any) =>
-            String(curso.nome_curto).includes("20262")
+          ...graduacao.filter(
+            (curso: any) =>
+              String(
+                curso.nome_curto
+              ).includes("20262")
           ),
-          ...pos.filter((curso: any) =>
-            String(curso.nome_curto).includes("20262")
+          ...pos.filter(
+            (curso: any) =>
+              String(
+                curso.nome_curto
+              ).includes("20262")
           )
         ];
 
         if (courseid) {
-          cursosAtivos = cursosAtivos.filter(
-            (curso: any) =>
-              Number(curso.id) === Number(courseid)
-          );
+          cursosAtivos =
+            cursosAtivos.filter(
+              (curso: any) =>
+                Number(curso.id) ===
+                Number(courseid)
+            );
         }
 
-        if (courseid && cursosAtivos.length === 0) {
+        if (
+          courseid &&
+          cursosAtivos.length === 0
+        ) {
           throw new Error(
             `Disciplina com courseid ${courseid} não encontrada no semestre 2026.2 para o filtro selecionado.`
           );
@@ -452,33 +623,54 @@ function createServer() {
               identidadeCurso
             );
 
-          resultados.push(...pendencias);
+          resultados.push(
+            ...pendencias
+          );
         }
 
-        const filtradas = resultados
-          .filter((item: any) => {
-            if (item.vencimento === null) {
-              return incluir_sem_data;
-            }
+        const filtradas =
+          resultados
+            .filter((item: any) => {
+              if (
+                item.vencimento === null
+              ) {
+                return incluir_sem_data;
+              }
 
-            return (
-              item.vencimento >= agora &&
-              item.vencimento <= limite
+              return (
+                item.vencimento >=
+                  agora &&
+                item.vencimento <=
+                  limite
+              );
+            })
+            .sort(
+              (a: any, b: any) => {
+                if (
+                  a.vencimento === null &&
+                  b.vencimento === null
+                ) {
+                  return 0;
+                }
+
+                if (
+                  a.vencimento === null
+                ) {
+                  return 1;
+                }
+
+                if (
+                  b.vencimento === null
+                ) {
+                  return -1;
+                }
+
+                return (
+                  a.vencimento -
+                  b.vencimento
+                );
+              }
             );
-          })
-          .sort((a: any, b: any) => {
-            if (
-              a.vencimento === null &&
-              b.vencimento === null
-            ) {
-              return 0;
-            }
-
-            if (a.vencimento === null) return 1;
-            if (b.vencimento === null) return -1;
-
-            return a.vencimento - b.vencimento;
-          });
 
         return {
           content: [
@@ -491,17 +683,22 @@ function createServer() {
                   filtros: {
                     dias,
                     identidade,
-                    courseid: courseid ?? null,
+                    courseid:
+                      courseid ?? null,
                     incluir_sem_data
                   },
                   periodo: {
-                    inicio_timestamp: agora,
-                    fim_timestamp: limite
+                    inicio_timestamp:
+                      agora,
+                    fim_timestamp:
+                      limite
                   },
                   disciplinas_consultadas:
                     cursosAtivos.length,
-                  total: filtradas.length,
-                  pendencias: filtradas
+                  total:
+                    filtradas.length,
+                  pendencias:
+                    filtradas
                 },
                 null,
                 2
@@ -517,7 +714,9 @@ function createServer() {
               text: JSON.stringify(
                 {
                   sucesso: false,
-                  erro: error?.message || String(error)
+                  erro:
+                    error?.message ||
+                    String(error)
                 },
                 null,
                 2
@@ -553,7 +752,10 @@ function createServer() {
           ),
 
         modo: z
-          .enum(["amplo", "exato"])
+          .enum([
+            "amplo",
+            "exato"
+          ])
           .default("amplo")
           .describe(
             "amplo encontra materiais relacionados ao termo; exato retorna apenas módulos ou arquivos cujo próprio nome/metadados contenham o termo"
@@ -566,140 +768,103 @@ function createServer() {
       modo = "amplo"
     }) => {
       try {
-        const { identidade, curso } =
-          await encontrarDisciplina(courseid);
-
-        const conteudo = await moodleCall(
+        const {
           identidade,
-          "core_course_get_contents",
-          {
-            courseid: String(courseid)
-          }
-        );
+          curso,
+          materiais
+        } =
+          await obterMateriaisDaDisciplina(
+            courseid
+          );
 
-        const tiposMaterial = new Set([
-          "resource",
-          "folder",
-          "url",
-          "page",
-          "book"
-        ]);
-
-        const materiais: any[] = [];
-
-        if (Array.isArray(conteudo)) {
-          for (const secao of conteudo) {
-            if (!Array.isArray(secao.modules)) continue;
-
-            for (const modulo of secao.modules) {
-              if (!tiposMaterial.has(modulo.modname)) {
-                continue;
-              }
-
-              const arquivos = Array.isArray(modulo.contents)
-                ? modulo.contents.map((arquivo: any) => ({
-                    nome: arquivo.filename ?? null,
-                    tipo: arquivo.type ?? null,
-                    mimetype: arquivo.mimetype ?? null,
-                    tamanho: arquivo.filesize ?? null,
-                    url_arquivo: arquivo.fileurl ?? null,
-                    modificado_em:
-                      arquivo.timemodified ?? null
-                  }))
-                : [];
-
-              materiais.push({
-                disciplina_id: curso.id,
-                disciplina: curso.nome,
-                identidade,
-                secao_id: secao.id,
-                secao: secao.name,
-                modulo_id: modulo.id,
-                nome: modulo.name,
-                tipo: modulo.modname,
-                url: modulo.url ?? null,
-                descricao: modulo.description ?? null,
-                visivel: modulo.visible,
-                arquivos
-              });
-            }
-          }
-        }
-
-        let resultado = materiais;
+        let resultado =
+          materiais;
 
         if (termo) {
           if (modo === "amplo") {
-            resultado = materiais.filter(
-              (material: any) => {
-                const arquivosTexto =
-                  material.arquivos
-                    .map((arquivo: any) =>
-                      [
-                        arquivo.nome,
-                        arquivo.tipo,
-                        arquivo.mimetype
-                      ]
-                        .filter(Boolean)
-                        .join(" ")
-                    )
-                    .join(" ");
+            resultado =
+              materiais.filter(
+                (material: any) => {
+                  const arquivosTexto =
+                    material.arquivos
+                      .map(
+                        (
+                          arquivo: any
+                        ) =>
+                          [
+                            arquivo.nome,
+                            arquivo.tipo,
+                            arquivo.mimetype
+                          ]
+                            .filter(
+                              Boolean
+                            )
+                            .join(" ")
+                      )
+                      .join(" ");
 
-                return correspondeAoTermo(
-                  termo,
-                  [
-                    material.nome,
-                    material.secao,
-                    material.tipo,
-                    material.descricao,
-                    arquivosTexto
-                  ]
-                );
-              }
-            );
-          }
-
-          if (modo === "exato") {
-            resultado = materiais
-              .map((material: any) => {
-                const moduloCorresponde =
-                  correspondeAoTermo(
+                  return correspondeAoTermo(
                     termo,
                     [
                       material.nome,
+                      material.secao,
                       material.tipo,
-                      material.descricao
+                      material.descricao,
+                      arquivosTexto
                     ]
                   );
+                }
+              );
+          }
 
-                const arquivosCorrespondentes =
-                  material.arquivos.filter(
-                    (arquivo: any) =>
+          if (modo === "exato") {
+            resultado =
+              materiais
+                .map(
+                  (material: any) => {
+                    const moduloCorresponde =
                       correspondeAoTermo(
                         termo,
                         [
-                          arquivo.nome,
-                          arquivo.tipo,
-                          arquivo.mimetype
+                          material.nome,
+                          material.tipo,
+                          material.descricao
                         ]
-                      )
-                  );
+                      );
 
-                if (
-                  !moduloCorresponde &&
-                  arquivosCorrespondentes.length === 0
-                ) {
-                  return null;
-                }
+                    const arquivosCorrespondentes =
+                      material.arquivos.filter(
+                        (
+                          arquivo: any
+                        ) =>
+                          correspondeAoTermo(
+                            termo,
+                            [
+                              arquivo.nome,
+                              arquivo.tipo,
+                              arquivo.mimetype
+                            ]
+                          )
+                      );
 
-                return {
-                  ...material,
-                  arquivos: moduloCorresponde
-                    ? material.arquivos
-                    : arquivosCorrespondentes
-                };
-              })
-              .filter(Boolean);
+                    if (
+                      !moduloCorresponde &&
+                      arquivosCorrespondentes.length ===
+                        0
+                    ) {
+                      return null;
+                    }
+
+                    return {
+                      ...material,
+                      arquivos:
+                        moduloCorresponde
+                          ? material.arquivos
+                          : arquivosCorrespondentes
+                    };
+                  }
+                )
+                .filter(Boolean);
           }
         }
 
@@ -713,15 +878,19 @@ function createServer() {
                   disciplina: {
                     id: curso.id,
                     nome: curso.nome,
-                    nome_curto: curso.nome_curto,
+                    nome_curto:
+                      curso.nome_curto,
                     identidade
                   },
                   filtro: {
-                    termo: termo ?? null,
+                    termo:
+                      termo ?? null,
                     modo
                   },
-                  total: resultado.length,
-                  materiais: resultado
+                  total:
+                    resultado.length,
+                  materiais:
+                    resultado
                 },
                 null,
                 2
@@ -738,9 +907,184 @@ function createServer() {
                 {
                   sucesso: false,
                   courseid,
-                  termo: termo ?? null,
+                  termo:
+                    termo ?? null,
                   modo,
-                  erro: error?.message || String(error)
+                  erro:
+                    error?.message ||
+                    String(error)
+                },
+                null,
+                2
+              )
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "testar_acesso_material",
+    {
+      description:
+        "Testa se o Worker consegue baixar de forma autenticada um arquivo de uma disciplina do Moodle UFSC. Não retorna o conteúdo do arquivo nem expõe tokens.",
+      inputSchema: z.object({
+        courseid: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "ID numérico da disciplina"
+          ),
+
+        termo: z
+          .string()
+          .trim()
+          .min(1)
+          .describe(
+            "Termo para localizar o arquivo a ser testado, por exemplo DEMATEL"
+          )
+      })
+    },
+    async ({
+      courseid,
+      termo
+    }) => {
+      try {
+        const {
+          identidade,
+          curso,
+          materiais
+        } =
+          await obterMateriaisDaDisciplina(
+            courseid
+          );
+
+        let arquivoEncontrado:
+          | {
+              material: any;
+              arquivo: any;
+            }
+          | null = null;
+
+        for (
+          const material of materiais
+        ) {
+          const arquivos =
+            Array.isArray(
+              material.arquivos
+            )
+              ? material.arquivos
+              : [];
+
+          for (
+            const arquivo of arquivos
+          ) {
+            if (
+              arquivo.url_arquivo &&
+              correspondeAoTermo(
+                termo,
+                [
+                  material.nome,
+                  arquivo.nome,
+                  arquivo.mimetype
+                ]
+              )
+            ) {
+              arquivoEncontrado = {
+                material,
+                arquivo
+              };
+
+              break;
+            }
+          }
+
+          if (arquivoEncontrado) {
+            break;
+          }
+        }
+
+        if (!arquivoEncontrado) {
+          throw new Error(
+            `Nenhum arquivo com o termo "${termo}" foi encontrado na disciplina.`
+          );
+        }
+
+        const teste =
+          await testarDownloadAutenticado(
+            arquivoEncontrado
+              .arquivo
+              .url_arquivo,
+            identidade
+          );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso:
+                    teste.sucesso,
+                  disciplina: {
+                    id: curso.id,
+                    nome: curso.nome,
+                    identidade
+                  },
+                  material: {
+                    nome:
+                      arquivoEncontrado
+                        .material
+                        .nome,
+                    secao:
+                      arquivoEncontrado
+                        .material
+                        .secao,
+                    tipo:
+                      arquivoEncontrado
+                        .material
+                        .tipo
+                  },
+                  arquivo: {
+                    nome:
+                      arquivoEncontrado
+                        .arquivo
+                        .nome,
+                    mimetype:
+                      arquivoEncontrado
+                        .arquivo
+                        .mimetype,
+                    tamanho_moodle:
+                      arquivoEncontrado
+                        .arquivo
+                        .tamanho
+                  },
+                  download: teste
+                },
+                null,
+                2
+              )
+            }
+          ],
+          isError:
+            !teste.sucesso
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: false,
+                  courseid,
+                  termo,
+                  erro:
+                    error?.message ||
+                    String(error)
                 },
                 null,
                 2
@@ -762,28 +1106,45 @@ export default {
     workerEnv: any,
     ctx: ExecutionContext
   ) {
-    const url = new URL(request.url);
+    const url =
+      new URL(request.url);
 
-    if (url.pathname === "/mcp") {
+    if (
+      url.pathname === "/mcp"
+    ) {
       const expectedKey =
-        await workerEnv.CLAUDE_CONNECTOR_KEY_V2.get();
+        await workerEnv
+          .CLAUDE_CONNECTOR_KEY_V2
+          .get();
 
       const authorization =
-        request.headers.get("authorization");
+        request.headers.get(
+          "authorization"
+        );
 
       const providedKey =
-        authorization?.startsWith("Bearer ")
+        authorization?.startsWith(
+          "Bearer "
+        )
           ? authorization.slice(7)
           : null;
 
-      if (!providedKey || providedKey !== expectedKey) {
-        return new Response("Unauthorized", {
-          status: 401
-        });
+      if (
+        !providedKey ||
+        providedKey !== expectedKey
+      ) {
+        return new Response(
+          "Unauthorized",
+          {
+            status: 401
+          }
+        );
       }
     }
 
-    return createMcpHandler(createServer)(
+    return createMcpHandler(
+      createServer
+    )(
       request,
       workerEnv,
       ctx
