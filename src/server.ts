@@ -3,6 +3,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
 import { getDocument } from "pdfjs-serverless";
+import { unzipSync } from "fflate";
 
 const MOODLE_URL =
   "https://presencial.moodle.ufsc.br/webservice/rest/server.php";
@@ -11,6 +12,8 @@ const MOODLE_HOST = "presencial.moodle.ufsc.br";
 const MAX_PDF_BYTES = 8 * 1024 * 1024;
 const MAX_PDF_PAGES = 60;
 const MAX_TEXT_CHARS = 120_000;
+const MAX_DOCX_BYTES = 8 * 1024 * 1024;
+const MAX_HTML_BYTES = 4 * 1024 * 1024;
 
 type MoodleIdentity = "graduacao" | "pos";
 
@@ -515,6 +518,378 @@ async function extrairTextoPdf(bytes: Uint8Array) {
 }
 
 
+function decodificarEntidadesHtml(texto: string): string {
+  const entidades: Record<string, string> = {
+    "&amp;": "&",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&#39;": "'",
+    "&apos;": "'",
+    "&nbsp;": " "
+  };
+
+  return texto
+    .replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (m) =>
+      entidades[m] ?? m
+    )
+    .replace(/&#(\d+);/g, (_m, n) => {
+      const code = Number(n);
+      return Number.isFinite(code)
+        ? String.fromCodePoint(code)
+        : _m;
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_m, h) => {
+      const code = parseInt(h, 16);
+      return Number.isFinite(code)
+        ? String.fromCodePoint(code)
+        : _m;
+    });
+}
+
+function htmlParaTexto(html: string): string {
+  return decodificarEntidadesHtml(
+    html
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+      .replace(/<br\s*\/?\s*>/gi, "\n")
+      .replace(/<\/(p|div|li|tr|h[1-6]|table|section|article)>/gi, "\n")
+      .replace(/<li\b[^>]*>/gi, "• ")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function xmlWordParaTexto(xml: string): string {
+  const comQuebras = xml
+    .replace(/<w:tab\b[^>]*\/>/gi, "\t")
+    .replace(/<w:br\b[^>]*\/>/gi, "\n")
+    .replace(/<w:cr\b[^>]*\/>/gi, "\n")
+    .replace(/<\/w:p>/gi, "\n")
+    .replace(/<\/w:tr>/gi, "\n")
+    .replace(/<\/w:tc>/gi, "\t");
+
+  return decodificarEntidadesHtml(
+    comQuebras.replace(/<[^>]+>/g, "")
+  )
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extrairTextoDocx(bytes: Uint8Array) {
+  const zip = unzipSync(bytes);
+  const decoder = new TextDecoder("utf-8");
+
+  const nomes = Object.keys(zip).filter((nome) =>
+    /^word\/(document|footnotes|endnotes|header\d+|footer\d+)\.xml$/i.test(
+      nome
+    )
+  );
+
+  if (!nomes.includes("word/document.xml")) {
+    throw new Error(
+      "O DOCX não contém word/document.xml e não pôde ser interpretado."
+    );
+  }
+
+  nomes.sort((a, b) => {
+    if (a === "word/document.xml") return -1;
+    if (b === "word/document.xml") return 1;
+    return a.localeCompare(b);
+  });
+
+  const partes: string[] = [];
+
+  for (const nome of nomes) {
+    const xml = decoder.decode(zip[nome]);
+    const texto = xmlWordParaTexto(xml);
+    if (!texto) continue;
+
+    const rotulo =
+      nome === "word/document.xml"
+        ? "Documento"
+        : nome
+            .replace("word/", "")
+            .replace(".xml", "");
+
+    partes.push(`--- ${rotulo} ---\n${texto}`);
+  }
+
+  const textoCompleto = partes.join("\n\n").trim();
+  const truncado = textoCompleto.length > MAX_TEXT_CHARS;
+  const texto = truncado
+    ? textoCompleto.slice(0, MAX_TEXT_CHARS)
+    : textoCompleto;
+
+  return {
+    caracteres_totais_estimados: textoCompleto.length,
+    caracteres_retornados: texto.length,
+    limite_caracteres: MAX_TEXT_CHARS,
+    truncado,
+    partes_xml_processadas: nomes,
+    texto
+  };
+}
+
+function extrairUrlsIframe(html: string): string[] {
+  const urls: string[] = [];
+  const regex = /<iframe\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi;
+
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(html)) !== null) {
+    if (match[1]) {
+      urls.push(decodificarEntidadesHtml(match[1]));
+    }
+  }
+
+  return [...new Set(urls)];
+}
+
+async function baixarTextoLimitado(
+  urlTexto: string,
+  limiteBytes: number = MAX_HTML_BYTES
+) {
+  const url = new URL(urlTexto);
+
+  const hostsPermitidos = new Set([
+    "docs.google.com",
+    MOODLE_HOST
+  ]);
+
+  if (!hostsPermitidos.has(url.hostname)) {
+    throw new Error(
+      `Host não permitido para leitura HTML: ${url.hostname}`
+    );
+  }
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "user-agent": "Mozilla/5.0 Moodle-UFSC-MCP/1.0"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Falha ao baixar HTML: HTTP ${response.status}.`
+    );
+  }
+
+  const lengthHeader = response.headers.get("content-length");
+  const contentLength = lengthHeader ? Number(lengthHeader) : null;
+
+  if (
+    contentLength !== null &&
+    Number.isFinite(contentLength) &&
+    contentLength > limiteBytes
+  ) {
+    if (response.body) {
+      try {
+        await response.body.cancel();
+      } catch {}
+    }
+
+    throw new Error(
+      `HTML excede o limite de ${Math.round(
+        limiteBytes / 1024 / 1024
+      )} MB.`
+    );
+  }
+
+  if (!response.body) {
+    return "";
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    total += value.byteLength;
+    if (total > limiteBytes) {
+      try {
+        await reader.cancel();
+      } catch {}
+      throw new Error(
+        `HTML excede o limite de ${Math.round(
+          limiteBytes / 1024 / 1024
+        )} MB.`
+      );
+    }
+
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+async function obterPaginaMoodle(
+  courseid: number,
+  identidade: MoodleIdentity,
+  termo: string
+) {
+  const retorno = await moodleCall(
+    identidade,
+    "mod_page_get_pages_by_courses",
+    {
+      "courseids[0]": String(courseid)
+    }
+  );
+
+  const paginas = Array.isArray(retorno?.pages)
+    ? retorno.pages
+    : [];
+
+  const candidatos = paginas.filter((page: any) =>
+    correspondeAoTermo(termo, [
+      page.name,
+      page.intro,
+      page.content
+    ])
+  );
+
+  if (candidatos.length === 0) {
+    return null;
+  }
+
+  candidatos.sort(
+    (a: any, b: any) =>
+      Number(b.timemodified ?? 0) -
+      Number(a.timemodified ?? 0)
+  );
+
+  return candidatos[0];
+}
+
+async function extrairTextoPaginaMoodle(page: any) {
+  const content = String(page?.content ?? "");
+  const textoDireto = htmlParaTexto(content);
+  const iframes = extrairUrlsIframe(content);
+  const fontes: any[] = [];
+  const partes: string[] = [];
+
+  if (textoDireto) {
+    partes.push(textoDireto);
+    fontes.push({
+      tipo: "html_moodle",
+      url: null,
+      caracteres: textoDireto.length
+    });
+  }
+
+  for (const iframeUrl of iframes.slice(0, 5)) {
+    try {
+      const url = new URL(iframeUrl);
+
+      if (url.hostname !== "docs.google.com") {
+        fontes.push({
+          tipo: "iframe_nao_suportado",
+          url: iframeUrl
+        });
+        continue;
+      }
+
+      const htmlPublicado = await baixarTextoLimitado(
+        iframeUrl,
+        MAX_HTML_BYTES
+      );
+      const textoPublicado = htmlParaTexto(htmlPublicado);
+
+      if (textoPublicado) {
+        partes.push(textoPublicado);
+        fontes.push({
+          tipo: url.pathname.includes("/presentation/")
+            ? "google_slides_publicado"
+            : "google_docs_publicado",
+          url: iframeUrl,
+          caracteres: textoPublicado.length
+        });
+      }
+    } catch (error: any) {
+      fontes.push({
+        tipo: "erro_iframe",
+        url: iframeUrl,
+        erro: error?.message || String(error)
+      });
+    }
+  }
+
+  const textoCompleto = partes
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+
+  const truncado = textoCompleto.length > MAX_TEXT_CHARS;
+  const texto = truncado
+    ? textoCompleto.slice(0, MAX_TEXT_CHARS)
+    : textoCompleto;
+
+  return {
+    texto,
+    truncado,
+    caracteres_retornados: texto.length,
+    limite_caracteres: MAX_TEXT_CHARS,
+    iframes_detectados: iframes,
+    fontes
+  };
+}
+
+function localizarArquivoPorTermo(
+  materiais: any[],
+  termo: string,
+  extensoes: string[]
+) {
+  const extNorm = extensoes.map((e) => normalizarTexto(e));
+
+  for (const material of materiais) {
+    const arquivos = Array.isArray(material.arquivos)
+      ? material.arquivos
+      : [];
+
+    for (const arquivo of arquivos) {
+      const nome = normalizarTexto(arquivo.nome);
+      const mime = normalizarTexto(arquivo.mimetype);
+      const formatoOk = extNorm.some(
+        (ext) => nome.endsWith(ext) || mime.includes(ext.replace(".", ""))
+      );
+
+      if (
+        formatoOk &&
+        arquivo.url_arquivo &&
+        correspondeAoTermo(termo, [
+          material.nome,
+          material.secao,
+          arquivo.nome,
+          arquivo.mimetype
+        ])
+      ) {
+        return { material, arquivo };
+      }
+    }
+  }
+
+  return null;
+}
+
+
 function truncarTexto(valor: any, limite: number = 4000): string | null {
   if (valor === null || valor === undefined) return null;
   const texto = String(valor);
@@ -733,7 +1108,7 @@ async function diagnosticarFormatosPlano(
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "6.1.0"
+    version: "6.2.0"
   });
 
   server.registerTool(
@@ -1326,7 +1701,7 @@ function createServer() {
     "ler_material",
     {
       description:
-        "Localiza e lê o texto de um PDF do Moodle UFSC. PDFs acima de 8 MB não são processados e retornam uma indicação estruturada de arquivo grande.",
+        "Localiza e lê materiais acadêmicos do Moodle UFSC em PDF, DOCX ou página HTML do Moodle. Para páginas com Google Docs publicado, também tenta extrair o texto incorporado.",
       inputSchema: z.object({
         courseid: z
           .number()
@@ -1340,7 +1715,7 @@ function createServer() {
           .trim()
           .min(1)
           .describe(
-            "Termo usado para localizar o PDF, por exemplo DEMATEL ou plano de ensino"
+            "Termo usado para localizar o material, por exemplo plano de ensino, cronograma ou DEMATEL"
           )
       })
     },
@@ -1349,84 +1724,127 @@ function createServer() {
         const { identidade, curso, materiais } =
           await obterMateriaisDaDisciplina(courseid);
 
-        const encontrado =
-          localizarPrimeiroArquivo(materiais, termo);
+        const arquivoPdf = localizarArquivoPorTermo(
+          materiais,
+          termo,
+          [".pdf", "application/pdf"]
+        );
 
-        if (!encontrado) {
+        const arquivoDocx = localizarArquivoPorTermo(
+          materiais,
+          termo,
+          [
+            ".docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          ]
+        );
+
+        const pagina = await obterPaginaMoodle(
+          courseid,
+          identidade,
+          termo
+        );
+
+        if (!arquivoPdf && !arquivoDocx && !pagina) {
           throw new Error(
-            `Nenhum arquivo com o termo "${termo}" foi encontrado na disciplina.`
+            `Nenhum material suportado com o termo "${termo}" foi encontrado na disciplina.`
           );
         }
 
-        const nomeArquivo =
-          encontrado.arquivo.nome ?? "arquivo";
-        const mimetypeMoodle =
-          encontrado.arquivo.mimetype ?? null;
+        if (arquivoPdf) {
+          const nomeArquivo =
+            arquivoPdf.arquivo.nome ?? "arquivo.pdf";
 
-        const parecePdf =
-          normalizarTexto(nomeArquivo).endsWith(".pdf") ||
-          normalizarTexto(mimetypeMoodle).includes("application/pdf");
+          const download = await baixarArquivoAutenticado(
+            arquivoPdf.arquivo.url_arquivo,
+            identidade,
+            MAX_PDF_BYTES
+          );
 
-        if (!parecePdf) {
+          if (!download.sucesso) {
+            const tamanhoMb =
+              Math.round(
+                (download.tamanho_bytes / 1024 / 1024) * 100
+              ) / 100;
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      sucesso: false,
+                      formato: "pdf",
+                      motivo: "arquivo_muito_grande",
+                      limite_mb: MAX_PDF_BYTES / 1024 / 1024,
+                      tamanho_mb: tamanhoMb,
+                      arquivo: nomeArquivo,
+                      disciplina: {
+                        id: curso.id,
+                        nome: curso.nome,
+                        identidade
+                      },
+                      mensagem:
+                        "O PDF excede o limite de processamento direto do Worker."
+                    },
+                    null,
+                    2
+                  )
+                }
+              ],
+              isError: false
+            };
+          }
+
+          const extracao = await extrairTextoPdf(download.bytes);
+          const semTexto = extracao.texto.trim().length === 0;
+
           return {
             content: [
               {
                 type: "text",
                 text: JSON.stringify(
                   {
-                    sucesso: false,
-                    motivo: "formato_nao_suportado",
+                    sucesso: !semTexto,
+                    formato: "pdf",
+                    motivo: semTexto
+                      ? "pdf_sem_texto_extraivel"
+                      : null,
                     disciplina: {
                       id: curso.id,
                       nome: curso.nome,
                       identidade
+                    },
+                    material: {
+                      nome: arquivoPdf.material.nome,
+                      secao: arquivoPdf.material.secao
                     },
                     arquivo: {
                       nome: nomeArquivo,
-                      mimetype: mimetypeMoodle
+                      mimetype: arquivoPdf.arquivo.mimetype,
+                      tamanho_bytes: download.tamanho_bytes,
+                      tamanho_mb:
+                        Math.round(
+                          (download.tamanho_bytes / 1024 / 1024) * 100
+                        ) / 100
                     },
-                    mensagem:
-                      "A leitura automática desta versão suporta apenas arquivos PDF."
-                  },
-                  null,
-                  2
-                )
-              }
-            ],
-            isError: true
-          };
-        }
-
-        const download = await baixarArquivoAutenticado(
-          encontrado.arquivo.url_arquivo,
-          identidade,
-          MAX_PDF_BYTES
-        );
-
-        if (!download.sucesso) {
-          const tamanhoMb =
-            Math.round(
-              (download.tamanho_bytes / 1024 / 1024) * 100
-            ) / 100;
-
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  {
-                    sucesso: false,
-                    motivo: "arquivo_muito_grande",
-                    limite_mb: MAX_PDF_BYTES / 1024 / 1024,
-                    tamanho_mb: tamanhoMb,
-                    arquivo: nomeArquivo,
-                    disciplina: {
-                      id: curso.id,
-                      nome: curso.nome,
-                      identidade
+                    extracao: {
+                      paginas_total: extracao.paginas_total,
+                      paginas_processadas:
+                        extracao.paginas_processadas,
+                      limite_paginas: extracao.limite_paginas,
+                      caracteres_retornados:
+                        extracao.caracteres_retornados,
+                      limite_caracteres:
+                        extracao.limite_caracteres,
+                      truncado: extracao.truncado
                     },
-                    mensagem:
-                      "O PDF excede o limite de processamento direto do Worker."
+                    mensagem: semTexto
+                      ? "O PDF foi aberto, mas não contém texto extraível. Pode ser um PDF digitalizado/imagem."
+                      : extracao.truncado
+                        ? "Texto extraído com sucesso, mas o retorno foi truncado pelos limites de segurança."
+                        : "Texto extraído com sucesso.",
+                    texto: extracao.texto
                   },
                   null,
                   2
@@ -1437,96 +1855,164 @@ function createServer() {
           };
         }
 
-        const contentType =
-          normalizarTexto(download.content_type);
+        if (arquivoDocx) {
+          const nomeArquivo =
+            arquivoDocx.arquivo.nome ?? "arquivo.docx";
 
-        if (
-          contentType &&
-          !contentType.includes("application/pdf") &&
-          !contentType.includes("octet-stream")
-        ) {
+          const download = await baixarArquivoAutenticado(
+            arquivoDocx.arquivo.url_arquivo,
+            identidade,
+            MAX_DOCX_BYTES
+          );
+
+          if (!download.sucesso) {
+            const tamanhoMb =
+              Math.round(
+                (download.tamanho_bytes / 1024 / 1024) * 100
+              ) / 100;
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      sucesso: false,
+                      formato: "docx",
+                      motivo: "arquivo_muito_grande",
+                      limite_mb: MAX_DOCX_BYTES / 1024 / 1024,
+                      tamanho_mb: tamanhoMb,
+                      arquivo: nomeArquivo,
+                      disciplina: {
+                        id: curso.id,
+                        nome: curso.nome,
+                        identidade
+                      },
+                      mensagem:
+                        "O DOCX excede o limite de processamento direto do Worker."
+                    },
+                    null,
+                    2
+                  )
+                }
+              ],
+              isError: false
+            };
+          }
+
+          const extracao = extrairTextoDocx(download.bytes);
+          const semTexto = extracao.texto.trim().length === 0;
+
           return {
             content: [
               {
                 type: "text",
                 text: JSON.stringify(
                   {
-                    sucesso: false,
-                    motivo: "resposta_nao_pdf",
-                    arquivo: nomeArquivo,
-                    content_type: download.content_type,
-                    mensagem:
-                      "O Moodle não retornou um conteúdo reconhecido como PDF."
+                    sucesso: !semTexto,
+                    formato: "docx",
+                    motivo: semTexto
+                      ? "docx_sem_texto_extraivel"
+                      : null,
+                    disciplina: {
+                      id: curso.id,
+                      nome: curso.nome,
+                      identidade
+                    },
+                    material: {
+                      nome: arquivoDocx.material.nome,
+                      secao: arquivoDocx.material.secao
+                    },
+                    arquivo: {
+                      nome: nomeArquivo,
+                      mimetype: arquivoDocx.arquivo.mimetype,
+                      tamanho_bytes: download.tamanho_bytes,
+                      tamanho_mb:
+                        Math.round(
+                          (download.tamanho_bytes / 1024 / 1024) * 100
+                        ) / 100
+                    },
+                    extracao: {
+                      caracteres_totais_estimados:
+                        extracao.caracteres_totais_estimados,
+                      caracteres_retornados:
+                        extracao.caracteres_retornados,
+                      limite_caracteres:
+                        extracao.limite_caracteres,
+                      truncado: extracao.truncado,
+                      partes_xml_processadas:
+                        extracao.partes_xml_processadas
+                    },
+                    mensagem: semTexto
+                      ? "O DOCX foi aberto, mas não contém texto extraível."
+                      : extracao.truncado
+                        ? "Texto do DOCX extraído com sucesso, mas truncado pelo limite de segurança."
+                        : "Texto do DOCX extraído com sucesso.",
+                    texto: extracao.texto
                   },
                   null,
                   2
                 )
               }
             ],
-            isError: true
+            isError: false
           };
         }
 
-        const extracao =
-          await extrairTextoPdf(download.bytes);
+        if (pagina) {
+          const extracao = await extrairTextoPaginaMoodle(pagina);
+          const semTexto = extracao.texto.trim().length === 0;
 
-        const semTexto =
-          extracao.texto.trim().length === 0;
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    sucesso: !semTexto,
+                    formato: "pagina_html",
+                    motivo: semTexto
+                      ? "pagina_sem_texto_extraivel"
+                      : null,
+                    disciplina: {
+                      id: curso.id,
+                      nome: curso.nome,
+                      identidade
+                    },
+                    pagina: {
+                      id: pagina.id ?? null,
+                      nome: pagina.name ?? null,
+                      timemodified: pagina.timemodified ?? null
+                    },
+                    extracao: {
+                      caracteres_retornados:
+                        extracao.caracteres_retornados,
+                      limite_caracteres:
+                        extracao.limite_caracteres,
+                      truncado: extracao.truncado,
+                      iframes_detectados:
+                        extracao.iframes_detectados,
+                      fontes: extracao.fontes
+                    },
+                    mensagem: semTexto
+                      ? "A página foi localizada, mas não foi possível extrair texto útil do HTML ou dos conteúdos incorporados."
+                      : extracao.truncado
+                        ? "Texto da página extraído com sucesso, mas truncado pelo limite de segurança."
+                        : "Texto da página extraído com sucesso.",
+                    texto: extracao.texto
+                  },
+                  null,
+                  2
+                )
+              }
+            ],
+            isError: false
+          };
+        }
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  sucesso: !semTexto,
-                  motivo: semTexto
-                    ? "pdf_sem_texto_extraivel"
-                    : null,
-                  disciplina: {
-                    id: curso.id,
-                    nome: curso.nome,
-                    identidade
-                  },
-                  material: {
-                    nome: encontrado.material.nome,
-                    secao: encontrado.material.secao
-                  },
-                  arquivo: {
-                    nome: nomeArquivo,
-                    mimetype: mimetypeMoodle,
-                    tamanho_bytes: download.tamanho_bytes,
-                    tamanho_mb:
-                      Math.round(
-                        (download.tamanho_bytes / 1024 / 1024) * 100
-                      ) / 100
-                  },
-                  extracao: {
-                    paginas_total: extracao.paginas_total,
-                    paginas_processadas:
-                      extracao.paginas_processadas,
-                    limite_paginas:
-                      extracao.limite_paginas,
-                    caracteres_retornados:
-                      extracao.caracteres_retornados,
-                    limite_caracteres:
-                      extracao.limite_caracteres,
-                    truncado: extracao.truncado
-                  },
-                  mensagem: semTexto
-                    ? "O PDF foi aberto, mas não contém texto extraível. Pode ser um PDF digitalizado/imagem."
-                    : extracao.truncado
-                      ? "Texto extraído com sucesso, mas o retorno foi truncado pelos limites de segurança."
-                      : "Texto extraído com sucesso.",
-                  texto: extracao.texto
-                },
-                null,
-                2
-              )
-            }
-          ],
-          isError: false
-        };
+        throw new Error(
+          "Material localizado, mas nenhum formato compatível pôde ser processado."
+        );
       } catch (error: any) {
         return {
           content: [
@@ -1537,7 +2023,7 @@ function createServer() {
                   sucesso: false,
                   courseid,
                   termo,
-                  motivo: "erro_leitura_pdf",
+                  motivo: "erro_leitura_material",
                   erro: error?.message || String(error)
                 },
                 null,
@@ -1550,7 +2036,6 @@ function createServer() {
       }
     }
   );
-
 
   server.registerTool(
     "testar_formatos_plano",
