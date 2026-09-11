@@ -190,10 +190,17 @@ async function extrairPendenciasDaDisciplina(
   return pendencias;
 }
 
+function normalizarTexto(valor: any): string {
+  return String(valor ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "4.0.0"
+    version: "5.0.0"
   });
 
   server.registerTool(
@@ -279,8 +286,7 @@ function createServer() {
                     url: modulo.url,
                     visivel: modulo.visible,
                     descricao: modulo.description,
-                    disponibilidade:
-                      modulo.availability,
+                    disponibilidade: modulo.availability,
                     datas: modulo.dates,
                     conteudos: modulo.contents
                   }))
@@ -319,9 +325,7 @@ function createServer() {
                 {
                   sucesso: false,
                   courseid,
-                  erro:
-                    error?.message ||
-                    String(error)
+                  erro: error?.message || String(error)
                 },
                 null,
                 2
@@ -502,9 +506,176 @@ function createServer() {
               text: JSON.stringify(
                 {
                   sucesso: false,
-                  erro:
-                    error?.message ||
-                    String(error)
+                  erro: error?.message || String(error)
+                },
+                null,
+                2
+              )
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    "listar_materiais",
+    {
+      description:
+        "Lista e pesquisa materiais de uma disciplina do Moodle UFSC, incluindo PDFs, documentos, pastas, páginas, livros e links. É possível filtrar por um termo.",
+      inputSchema: z.object({
+        courseid: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "ID numérico da disciplina retornado por listar_disciplinas"
+          ),
+
+        termo: z
+          .string()
+          .trim()
+          .optional()
+          .describe(
+            "Termo opcional para pesquisar por nome do material, seção, tipo ou nome do arquivo"
+          )
+      })
+    },
+    async ({ courseid, termo }) => {
+      try {
+        const { identidade, curso } =
+          await encontrarDisciplina(courseid);
+
+        const conteudo = await moodleCall(
+          identidade,
+          "core_course_get_contents",
+          {
+            courseid: String(courseid)
+          }
+        );
+
+        const tiposMaterial = new Set([
+          "resource",
+          "folder",
+          "url",
+          "page",
+          "book"
+        ]);
+
+        const materiais: any[] = [];
+
+        if (Array.isArray(conteudo)) {
+          for (const secao of conteudo) {
+            if (!Array.isArray(secao.modules)) continue;
+
+            for (const modulo of secao.modules) {
+              if (!tiposMaterial.has(modulo.modname)) {
+                continue;
+              }
+
+              const arquivos = Array.isArray(modulo.contents)
+                ? modulo.contents.map((arquivo: any) => ({
+                    nome: arquivo.filename ?? null,
+                    tipo: arquivo.type ?? null,
+                    mimetype: arquivo.mimetype ?? null,
+                    tamanho: arquivo.filesize ?? null,
+                    url_arquivo: arquivo.fileurl ?? null,
+                    modificado_em:
+                      arquivo.timemodified ?? null
+                  }))
+                : [];
+
+              materiais.push({
+                disciplina_id: curso.id,
+                disciplina: curso.nome,
+                identidade,
+                secao_id: secao.id,
+                secao: secao.name,
+                modulo_id: modulo.id,
+                nome: modulo.name,
+                tipo: modulo.modname,
+                url: modulo.url ?? null,
+                descricao: modulo.description ?? null,
+                visivel: modulo.visible,
+                arquivos
+              });
+            }
+          }
+        }
+
+        const termoNormalizado = termo
+          ? normalizarTexto(termo)
+          : null;
+
+        const filtrados = termoNormalizado
+          ? materiais.filter((material: any) => {
+              const arquivosTexto = material.arquivos
+                .map((arquivo: any) =>
+                  [
+                    arquivo.nome,
+                    arquivo.tipo,
+                    arquivo.mimetype
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+                )
+                .join(" ");
+
+              const textoPesquisa = normalizarTexto(
+                [
+                  material.nome,
+                  material.secao,
+                  material.tipo,
+                  material.descricao,
+                  arquivosTexto
+                ]
+                  .filter(Boolean)
+                  .join(" ")
+              );
+
+              return textoPesquisa.includes(
+                termoNormalizado
+              );
+            })
+          : materiais;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: true,
+                  disciplina: {
+                    id: curso.id,
+                    nome: curso.nome,
+                    nome_curto: curso.nome_curto,
+                    identidade
+                  },
+                  filtro: {
+                    termo: termo ?? null
+                  },
+                  total: filtrados.length,
+                  materiais: filtrados
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: false,
+                  courseid,
+                  termo: termo ?? null,
+                  erro: error?.message || String(error)
                 },
                 null,
                 2
