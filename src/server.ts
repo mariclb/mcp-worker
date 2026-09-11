@@ -514,10 +514,226 @@ async function extrairTextoPdf(bytes: Uint8Array) {
   };
 }
 
+
+function truncarTexto(valor: any, limite: number = 4000): string | null {
+  if (valor === null || valor === undefined) return null;
+  const texto = String(valor);
+  return texto.length > limite
+    ? texto.slice(0, limite) + `\n...[truncado em ${limite} caracteres]`
+    : texto;
+}
+
+async function diagnosticarFormatosPlano(
+  courseid: number,
+  termo?: string
+) {
+  const { identidade, curso } =
+    await encontrarDisciplina(courseid);
+
+  const conteudo = await moodleCall(
+    identidade,
+    "core_course_get_contents",
+    {
+      courseid: String(courseid)
+    }
+  );
+
+  const paginasModulo: any[] = [];
+  const arquivosDocx: any[] = [];
+
+  if (Array.isArray(conteudo)) {
+    for (const secao of conteudo) {
+      if (!Array.isArray(secao.modules)) continue;
+
+      for (const modulo of secao.modules) {
+        if (modulo.modname === "page") {
+          const candidato = {
+            secao: secao.name,
+            id: modulo.id,
+            nome: modulo.name,
+            url: modulo.url ?? null,
+            descricao: truncarTexto(modulo.description, 2000),
+            disponibilidade: modulo.availability ?? null
+          };
+
+          if (
+            !termo ||
+            correspondeAoTermo(termo, [
+              secao.name,
+              modulo.name,
+              modulo.description
+            ])
+          ) {
+            paginasModulo.push(candidato);
+          }
+        }
+
+        const contents = Array.isArray(modulo.contents)
+          ? modulo.contents
+          : [];
+
+        for (const arquivo of contents) {
+          const nome = arquivo.filename ?? "";
+          const mimetype = arquivo.mimetype ?? "";
+          const ehDocx =
+            normalizarTexto(nome).endsWith(".docx") ||
+            normalizarTexto(mimetype).includes(
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            );
+
+          if (!ehDocx) continue;
+
+          if (
+            termo &&
+            !correspondeAoTermo(termo, [
+              secao.name,
+              modulo.name,
+              nome,
+              mimetype
+            ])
+          ) {
+            continue;
+          }
+
+          arquivosDocx.push({
+            secao: secao.name,
+            modulo_id: modulo.id,
+            modulo_nome: modulo.name,
+            nome,
+            mimetype,
+            tamanho_moodle: arquivo.filesize ?? null,
+            url_arquivo: arquivo.fileurl ?? null
+          });
+        }
+      }
+    }
+  }
+
+  let paginasApi: any = null;
+  let erroPaginasApi: string | null = null;
+
+  try {
+    const retorno = await moodleCall(
+      identidade,
+      "mod_page_get_pages_by_courses",
+      {
+        "courseids[0]": String(courseid)
+      }
+    );
+
+    const pages = Array.isArray(retorno?.pages)
+      ? retorno.pages
+      : [];
+
+    paginasApi = {
+      total: pages.length,
+      warnings: retorno?.warnings ?? [],
+      paginas: pages
+        .filter((page: any) =>
+          !termo ||
+          correspondeAoTermo(termo, [
+            page.name,
+            page.intro,
+            page.content
+          ])
+        )
+        .map((page: any) => ({
+          id: page.id ?? null,
+          course: page.course ?? null,
+          name: page.name ?? null,
+          timemodified: page.timemodified ?? null,
+          intro: truncarTexto(page.intro, 4000),
+          content: truncarTexto(page.content, 8000),
+          campos_disponiveis: Object.keys(page)
+        }))
+    };
+  } catch (error: any) {
+    erroPaginasApi = error?.message || String(error);
+  }
+
+  const testesDocx: any[] = [];
+
+  for (const docx of arquivosDocx.slice(0, 3)) {
+    if (!docx.url_arquivo) {
+      testesDocx.push({
+        nome: docx.nome,
+        sucesso: false,
+        motivo: "sem_url_arquivo"
+      });
+      continue;
+    }
+
+    try {
+      const download = await baixarArquivoAutenticado(
+        docx.url_arquivo,
+        identidade,
+        MAX_PDF_BYTES
+      );
+
+      if (!download.sucesso) {
+        testesDocx.push({
+          nome: docx.nome,
+          sucesso: false,
+          motivo: download.motivo,
+          tamanho_bytes: download.tamanho_bytes,
+          content_type: download.content_type
+        });
+        continue;
+      }
+
+      const assinatura = Array.from(
+        download.bytes.slice(0, 4)
+      )
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ");
+
+      testesDocx.push({
+        nome: docx.nome,
+        sucesso: true,
+        tamanho_bytes: download.tamanho_bytes,
+        content_type: download.content_type,
+        assinatura_hex_4_bytes: assinatura,
+        parece_zip_docx:
+          download.bytes.length >= 4 &&
+          download.bytes[0] === 0x50 &&
+          download.bytes[1] === 0x4b
+      });
+    } catch (error: any) {
+      testesDocx.push({
+        nome: docx.nome,
+        sucesso: false,
+        motivo: "erro_download",
+        erro: error?.message || String(error)
+      });
+    }
+  }
+
+  return {
+    disciplina: {
+      id: curso.id,
+      nome: curso.nome,
+      nome_curto: curso.nome_curto,
+      identidade
+    },
+    filtro_termo: termo ?? null,
+    html: {
+      paginas_detectadas_no_curso: paginasModulo.length,
+      paginas_modulo: paginasModulo,
+      mod_page_get_pages_by_courses: paginasApi,
+      erro_api_paginas: erroPaginasApi
+    },
+    docx: {
+      arquivos_detectados: arquivosDocx.length,
+      arquivos: arquivosDocx,
+      testes_download: testesDocx
+    }
+  };
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "6.0.0"
+    version: "6.1.0"
   });
 
   server.registerTool(
@@ -1322,6 +1538,75 @@ function createServer() {
                   courseid,
                   termo,
                   motivo: "erro_leitura_pdf",
+                  erro: error?.message || String(error)
+                },
+                null,
+                2
+              )
+            }
+          ],
+          isError: true
+        };
+      }
+    }
+  );
+
+
+  server.registerTool(
+    "testar_formatos_plano",
+    {
+      description:
+        "Diagnostica suporte a planos de ensino em página HTML do Moodle e arquivos DOCX. Não altera dados e não extrai ainda o texto do DOCX.",
+      inputSchema: z.object({
+        courseid: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            "ID numérico da disciplina retornado por listar_disciplinas"
+          ),
+        termo: z
+          .string()
+          .trim()
+          .optional()
+          .describe(
+            "Termo opcional para filtrar páginas ou arquivos, como plano, cronograma ou ensino"
+          )
+      })
+    },
+    async ({ courseid, termo }) => {
+      try {
+        const diagnostico = await diagnosticarFormatosPlano(
+          courseid,
+          termo
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: true,
+                  ...diagnostico
+                },
+                null,
+                2
+              )
+            }
+          ]
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  sucesso: false,
+                  courseid,
+                  termo: termo ?? null,
+                  motivo: "erro_diagnostico_formatos",
                   erro: error?.message || String(error)
                 },
                 null,
