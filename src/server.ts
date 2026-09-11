@@ -197,10 +197,21 @@ function normalizarTexto(valor: any): string {
     .toLowerCase();
 }
 
+function correspondeAoTermo(
+  termo: string,
+  valores: any[]
+): boolean {
+  const termoNormalizado = normalizarTexto(termo);
+
+  return valores.some((valor) =>
+    normalizarTexto(valor).includes(termoNormalizado)
+  );
+}
+
 function createServer() {
   const server = new McpServer({
     name: "Moodle UFSC",
-    version: "5.0.0"
+    version: "5.1.0"
   });
 
   server.registerTool(
@@ -523,7 +534,7 @@ function createServer() {
     "listar_materiais",
     {
       description:
-        "Lista e pesquisa materiais de uma disciplina do Moodle UFSC, incluindo PDFs, documentos, pastas, páginas, livros e links. É possível filtrar por um termo.",
+        "Lista e pesquisa materiais de uma disciplina do Moodle UFSC. Permite busca ampla ou exata por nome, seção, tipo e arquivos.",
       inputSchema: z.object({
         courseid: z
           .number()
@@ -538,11 +549,22 @@ function createServer() {
           .trim()
           .optional()
           .describe(
-            "Termo opcional para pesquisar por nome do material, seção, tipo ou nome do arquivo"
+            "Termo opcional para pesquisar materiais ou arquivos"
+          ),
+
+        modo: z
+          .enum(["amplo", "exato"])
+          .default("amplo")
+          .describe(
+            "amplo encontra materiais relacionados ao termo; exato retorna apenas módulos ou arquivos cujo próprio nome/metadados contenham o termo"
           )
       })
     },
-    async ({ courseid, termo }) => {
+    async ({
+      courseid,
+      termo,
+      modo = "amplo"
+    }) => {
       try {
         const { identidade, curso } =
           await encontrarDisciplina(courseid);
@@ -604,41 +626,82 @@ function createServer() {
           }
         }
 
-        const termoNormalizado = termo
-          ? normalizarTexto(termo)
-          : null;
+        let resultado = materiais;
 
-        const filtrados = termoNormalizado
-          ? materiais.filter((material: any) => {
-              const arquivosTexto = material.arquivos
-                .map((arquivo: any) =>
+        if (termo) {
+          if (modo === "amplo") {
+            resultado = materiais.filter(
+              (material: any) => {
+                const arquivosTexto =
+                  material.arquivos
+                    .map((arquivo: any) =>
+                      [
+                        arquivo.nome,
+                        arquivo.tipo,
+                        arquivo.mimetype
+                      ]
+                        .filter(Boolean)
+                        .join(" ")
+                    )
+                    .join(" ");
+
+                return correspondeAoTermo(
+                  termo,
                   [
-                    arquivo.nome,
-                    arquivo.tipo,
-                    arquivo.mimetype
+                    material.nome,
+                    material.secao,
+                    material.tipo,
+                    material.descricao,
+                    arquivosTexto
                   ]
-                    .filter(Boolean)
-                    .join(" ")
-                )
-                .join(" ");
+                );
+              }
+            );
+          }
 
-              const textoPesquisa = normalizarTexto(
-                [
-                  material.nome,
-                  material.secao,
-                  material.tipo,
-                  material.descricao,
-                  arquivosTexto
-                ]
-                  .filter(Boolean)
-                  .join(" ")
-              );
+          if (modo === "exato") {
+            resultado = materiais
+              .map((material: any) => {
+                const moduloCorresponde =
+                  correspondeAoTermo(
+                    termo,
+                    [
+                      material.nome,
+                      material.tipo,
+                      material.descricao
+                    ]
+                  );
 
-              return textoPesquisa.includes(
-                termoNormalizado
-              );
-            })
-          : materiais;
+                const arquivosCorrespondentes =
+                  material.arquivos.filter(
+                    (arquivo: any) =>
+                      correspondeAoTermo(
+                        termo,
+                        [
+                          arquivo.nome,
+                          arquivo.tipo,
+                          arquivo.mimetype
+                        ]
+                      )
+                  );
+
+                if (
+                  !moduloCorresponde &&
+                  arquivosCorrespondentes.length === 0
+                ) {
+                  return null;
+                }
+
+                return {
+                  ...material,
+                  arquivos: moduloCorresponde
+                    ? material.arquivos
+                    : arquivosCorrespondentes
+                };
+              })
+              .filter(Boolean);
+          }
+        }
 
         return {
           content: [
@@ -654,10 +717,11 @@ function createServer() {
                     identidade
                   },
                   filtro: {
-                    termo: termo ?? null
+                    termo: termo ?? null,
+                    modo
                   },
-                  total: filtrados.length,
-                  materiais: filtrados
+                  total: resultado.length,
+                  materiais: resultado
                 },
                 null,
                 2
@@ -675,6 +739,7 @@ function createServer() {
                   sucesso: false,
                   courseid,
                   termo: termo ?? null,
+                  modo,
                   erro: error?.message || String(error)
                 },
                 null,
